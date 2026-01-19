@@ -15,8 +15,8 @@ from dotenv import load_dotenv
 # pip install streamlit pandas finance-datareader matplotlib koreanize-matplotlib python-dotenv
 
 load_dotenv()
-my_name = os.getenv('MY_NAME')
-st.header(my_name)
+title = os.getenv('TITLE')
+st.header(title)
 
 def get_krx_company_list() -> pd.DataFrame:
     try:
@@ -63,39 +63,122 @@ confirm_btn = st.sidebar.button('조회하기') # 클릭하면 True
 
 # --- 메인 로직 ---
 if confirm_btn:
-    if not company_name: # '' 
-        st.warning("조회할 회사 이름을 입력하세요.")
+    if not company_name:
+        st.warning("회사명을 입력하세요.")
     else:
         try:
-            with st.spinner('데이터를 수집하는 중...'):
+            with st.spinner("데이터 수집 중..."):
                 stock_code = get_stock_code_by_company(company_name)
-                start_date = selected_dates[0].strftime("%Y%m%d")
-                end_date = selected_dates[1].strftime("%Y%m%d")
-                
-                price_df = fdr.DataReader(stock_code, start_date, end_date)
-                
+                start = selected_dates[0].strftime("%Y%m%d")
+                end = selected_dates[1].strftime("%Y%m%d")
+                price_df = fdr.DataReader(stock_code, start, end)
+
             if price_df.empty:
-                st.info("해당 기간의 주가 데이터가 없습니다.")
+                st.info("해당 기간 데이터가 없습니다.")
             else:
                 st.subheader(f"[{company_name}] 주가 데이터")
-                st.dataframe(price_df.tail(10), width="stretch")
+                st.dataframe(price_df.tail(10), use_container_width=True)
 
-                # Matplotlib 시각화
+                # =========================
+                # 📊 수익 & 리스크 계산
+                # =========================
+                price_df['Daily_Return'] = price_df['Close'].pct_change()
+                price_df['Cum_Max'] = price_df['Close'].cummax()
+                price_df['Drawdown'] = price_df['Close'] / price_df['Cum_Max'] - 1
+
+                start_price = price_df['Close'].iloc[0]
+                end_price = price_df['Close'].iloc[-1]
+                return_rate = (end_price / start_price - 1) * 100
+
+                volatility = price_df['Daily_Return'].std() * 100
+                downside_vol = price_df.loc[
+                    price_df['Daily_Return'] < 0,
+                    'Daily_Return'
+                ].std() * 100
+
+                mdd = price_df['Drawdown'].min() * 100
+
+                # MDD 회복 기간
+                mdd_date = price_df['Drawdown'].idxmin()
+                peak_price = price_df.loc[:mdd_date, 'Close'].max()
+                recovery_df = price_df.loc[mdd_date:]
+                recovery = recovery_df[recovery_df['Close'] >= peak_price]
+                recovery_days = (
+                    (recovery.index[0] - mdd_date).days
+                    if not recovery.empty else None
+                )
+
+                var_95 = price_df['Daily_Return'].quantile(0.05) * 100
+
+                # =========================
+                # 📊 요약 출력
+                # =========================
+                st.subheader("📊 수익 · 리스크 요약")
+
+                col1, col2, col3 = st.columns(3)
+
+                col1.metric("수익률", f"{return_rate:.2f}%")
+                col1.metric("변동성", f"{volatility:.2f}%")
+
+                col2.metric("MDD", f"{mdd:.2f}%")
+                col2.metric(
+                    "MDD 회복 기간",
+                    f"{recovery_days}일" if recovery_days else "미회복"
+                )
+
+                col3.metric("하방 변동성", f"{downside_vol:.2f}%")
+                col3.metric("VaR (95%)", f"{var_95:.2f}%")
+
+                # =========================
+                # 📈 이동평균선
+                # =========================
+                price_df['MA5'] = price_df['Close'].rolling(5).mean()
+                price_df['MA20'] = price_df['Close'].rolling(20).mean()
+                price_df['MA60'] = price_df['Close'].rolling(60).mean()
+
                 fig, ax = plt.subplots(figsize=(12, 5))
-                price_df['Close'].plot(ax=ax, grid=True, color='red')
-                ax.set_title(f"{company_name} 종가 추이", fontsize=15)
+
+                price_df['Close'].plot(ax=ax, label="종가", linewidth=2)
+                price_df['MA5'].plot(ax=ax, label="MA5", linestyle="--")
+                price_df['MA20'].plot(ax=ax, label="MA20", linestyle="-.")
+                price_df['MA60'].plot(ax=ax, label="MA60", linestyle=":")
+
+                # 🔴 Drawdown 구간 전체 음영
+                y_min = price_df[['Low', 'Close']].min().min()
+                y_max = price_df[['High', 'Close']].max().max()
+
+                ax.fill_between(
+                    price_df.index,
+                    y1=y_min,
+                    y2=y_max,
+                    where=price_df['Drawdown'] < 0,
+                    color="red",
+                    alpha=0.15,
+                    label="Drawdown 구간"
+                )
+
+                ax.set_title(f"{company_name} 종가 · 이동평균 · 리스크")
+                ax.set_ylabel("가격")
+                ax.legend()
+                ax.grid(True)
+
                 st.pyplot(fig)
 
-                # 엑셀 다운로드 기능
+                # =========================
+                # 📥 엑셀 다운로드
+                # =========================
                 output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    price_df.to_excel(writer, index=True, sheet_name='Sheet1')
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                    price_df.to_excel(writer, sheet_name="price")
+
                 st.download_button(
-                    label="📥 엑셀 파일 다운로드",
+                    label="📥 엑셀 다운로드",
                     data=output.getvalue(),
-                    file_name=f"{company_name}_주가.xlsx",
+                    file_name=f"{company_name}_주가_리스크분석.xlsx",
                     mime="application/vnd.ms-excel"
                 )
-        except Exception as e:
-            st.error(f"오류가 발생했습니다: {e}")
 
+        except Exception as e:
+            st.error(f"오류 발생: {e}")
+
+    
